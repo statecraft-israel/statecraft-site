@@ -1,0 +1,151 @@
+name: Site
+
+# Publishes the playable demo on GitHub Pages: the latest release's *-web-pages.zip unpacked at /demo/
+# (https://statecraft-israel.github.io/statecraft-site/demo/), with a root page and a 404 page that redirect to it.
+# This file lives in the public site repository statecraft-israel/statecraft-site. The game's source is private: the
+# nightly release job there (tools/nightly_publish.py) creates a release here holding only the *-web-pages.zip and
+# dispatches this workflow by file name. Pull requests that change this file only build and check the pages. Deploying
+# runs on main only (the github-pages environment allows main only), so a published release starts a run on main
+# instead of deploying from its tag. The demo never comes from git: it is a release asset. No secret is used.
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/site.yml"]
+  pull_request:
+    paths: [".github/workflows/site.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  on-release:
+    name: Site (start a deploy on main for the release)
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Run this workflow on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run site.yml --repo "$GITHUB_REPOSITORY" --ref main
+
+  build:
+    name: Site (demo pages)
+    if: github.event_name != 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Unpack the Latest release's Pages build at /demo/
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Every failure stops the run, so Pages keeps serving the last good deploy: no release, no
+          # *-web-pages.zip in it, an empty or incomplete zip, or a lookup error never deploys an empty site.
+          # The demo follows GitHub's Latest release, the one tools/nightly.py restores after a failed night, so a
+          # failed nightly that stays published is never deployed (the newest published release can be that one).
+          # Only HTTP 404 (no Latest at all) falls back to the newest published prerelease, the historic case;
+          # nightlies are created with prerelease=false, so the fallback cannot pick a failed nightly either. Any
+          # other lookup error (auth, network, rate limit, 5xx) stops the run. The tag is passed to view and download.
+          err="$(mktemp)"
+          if tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' 2>"$err")"; then
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              echo "::error::releases/latest returned no usable tag: nothing to deploy."
+              exit 1
+            fi
+            from="Latest"
+          elif grep -q 'HTTP 404' "$err"; then
+            tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts --json tagName,isPrerelease \
+                   --jq '[.[] | select(.isPrerelease)][0].tagName // empty')"
+            from="newest prerelease (no Latest)"
+            if [ -z "$tag" ]; then
+              echo "::error::No Latest release and no published prerelease: nothing to deploy."
+              exit 1
+            fi
+          else
+            cat "$err" >&2
+            echo "::error::The Latest release lookup failed (not a 404): nothing deployed."
+            exit 1
+          fi
+          asset="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name | select(endswith("-web-pages.zip"))] | first // empty')"
+          if [ -z "$asset" ]; then
+            echo "::error::No *-web-pages.zip in the $from release ($tag): nothing to deploy."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/web-pages" dist/demo
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/web-pages" --clobber
+          unzip -q -o "$RUNNER_TEMP/web-pages/$asset" -d dist/demo
+          test -f dist/demo/index.html
+          jq -e '.shareable == true' dist/demo/event-photos.json > /dev/null
+          echo "Demo at /demo/ from $asset ($from $tag)"
+      - name: Write the root page, a redirect to /demo/
+        run: |
+          set -euo pipefail
+          cat > dist/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=./demo/">
+          <title>Statecraft: Israel</title>
+          </head>
+          <body>
+          <p><a href="./demo/">Play Statecraft: Israel</a></p>
+          </body>
+          </html>
+          HTML
+          grep -q 'url=./demo/' dist/index.html
+      - name: Write the 404 page, a redirect to /demo/ for every missing path
+        # Pages serves 404.html at any depth (old /en/..., /he/..., /media/... links), so it names the absolute path.
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          [[ "$REPO_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Unexpected repository name: $REPO_NAME"; exit 1; }
+          demo="/$REPO_NAME/demo/"
+          cat > dist/404.html <<HTML
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="0; url=$demo">
+          <title>Statecraft: Israel</title>
+          </head>
+          <body>
+          <p><a href="$demo">Play Statecraft: Israel</a></p>
+          </body>
+          </html>
+          HTML
+          grep -q "url=$demo\"" dist/404.html
+      - name: Keep the pages for deploying
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    name: Site (deploy to GitHub Pages)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
